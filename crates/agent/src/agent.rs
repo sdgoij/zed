@@ -883,11 +883,23 @@ impl NativeAgent {
                             acp::UnstructuredCommandInput::new(hint),
                         ));
                     }
-                    Some([]) | None => {}
-                    Some(_) => {
-                        // skip >1 argument commands since we don't support them yet
-                        return None;
+                    Some([_, ..]) => {
+                        let hint: String = prompt
+                            .arguments
+                            .as_ref()
+                            .map(|args| {
+                                args.iter()
+                                    .map(|arg| format!("<{}>", arg.name))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                            .unwrap_or_default();
+
+                        command = command.input(acp::AvailableCommandInput::Unstructured(
+                            acp::UnstructuredCommandInput::new(hint),
+                        ));
                     }
+                    Some([]) | None => {}
                 }
 
                 Some(command)
@@ -1511,6 +1523,61 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
 
 pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Zed Agent"));
 
+fn parse_prompt_arguments(
+    arg_value: &str,
+    schema: Option<&[context_server::types::PromptArgument]>,
+) -> HashMap<String, String> {
+    let Some(arguments) = schema else {
+        return Default::default();
+    };
+
+    // Single argument: preserve the existing single-token behavior
+    if arguments.len() == 1 {
+        if arg_value.is_empty() {
+            return Default::default();
+        }
+        return HashMap::from_iter([(arguments[0].name.clone(), arg_value.to_string())]);
+    }
+
+    let arg_names: Vec<&str> = arguments.iter().map(|a| a.name.as_str()).collect();
+
+    // If the input contains any `=` signs, try as key=value pairs
+    if arg_value.contains('=') {
+        let args = parse_key_value_args(arg_value, &arg_names);
+        if !args.is_empty() {
+            return args;
+        }
+    }
+
+    // Otherwise, split on whitespace and assign positionally
+    parse_positional_args(arg_value, &arg_names)
+}
+
+fn parse_key_value_args(input: &str, arg_names: &[&str]) -> HashMap<String, String> {
+    let mut result = HashMap::default();
+    for pair in input.split_whitespace() {
+        if let Some((key, value)) = pair.split_once('=') {
+            let key = key.to_string();
+            if arg_names.contains(&key.as_str()) {
+                result.insert(key, value.to_string());
+            }
+        }
+    }
+    result
+}
+
+fn parse_positional_args(input: &str, arg_names: &[&str]) -> HashMap<String, String> {
+    let args: Vec<&str> = input.split_whitespace().collect();
+    args.into_iter()
+        .enumerate()
+        .filter_map(|(i, value)| {
+            arg_names
+                .get(i)
+                .map(|name| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 impl acp_thread::AgentConnection for NativeAgentConnection {
     fn agent_id(&self) -> AgentId {
         ZED_AGENT_ID.clone()
@@ -1607,18 +1674,10 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             if let Some(prompt) =
                 registry.find_prompt(explicit_server_id.as_ref(), parsed_command.prompt_name)
             {
-                let arguments = if !parsed_command.arg_value.is_empty()
-                    && let Some(arg_name) = prompt
-                        .prompt
-                        .arguments
-                        .as_ref()
-                        .and_then(|args| args.first())
-                        .map(|arg| arg.name.clone())
-                {
-                    HashMap::from_iter([(arg_name, parsed_command.arg_value.to_string())])
-                } else {
-                    Default::default()
-                };
+                let arguments = parse_prompt_arguments(
+                    parsed_command.arg_value,
+                    prompt.prompt.arguments.as_deref(),
+                );
 
                 let prompt_name = prompt.prompt.name.clone();
                 let server_id = prompt.server_id.clone();
@@ -3453,5 +3512,138 @@ fn mcp_message_content_to_acp_content_block(
             }
             acp::ContentBlock::ResourceLink(link)
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_prompt_arguments_tests {
+    use super::*;
+
+    fn arg_schema(names: &[&str]) -> Vec<context_server::types::PromptArgument> {
+        names
+            .iter()
+            .map(|name| context_server::types::PromptArgument {
+                name: name.to_string(),
+                description: None,
+                required: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_arg_empty() {
+        let schema = arg_schema(&["query"]);
+        assert!(parse_prompt_arguments("", Some(&schema)).is_empty());
+    }
+
+    #[test]
+    fn single_arg_value() {
+        let schema = arg_schema(&["query"]);
+        let result = parse_prompt_arguments("hello", Some(&schema));
+        assert_eq!(result.get("query"), Some(&"hello".to_string()));
+    }
+
+    #[test]
+    fn single_arg_whole_value() {
+        let schema = arg_schema(&["query"]);
+        let result = parse_prompt_arguments("hello world", Some(&schema));
+        assert_eq!(result.get("query"), Some(&"hello world".to_string()));
+    }
+
+    #[test]
+    fn no_schema() {
+        assert!(parse_prompt_arguments("anything", None).is_empty());
+    }
+
+    #[test]
+    fn positional_multi_arg_all() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("zed zed-ai", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert_eq!(result.get("repo"), Some(&"zed-ai".to_string()));
+    }
+
+    #[test]
+    fn positional_multi_arg_one() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("zed", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert!(result.get("repo").is_none());
+    }
+
+    #[test]
+    fn positional_multi_arg_excess() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("zed zed-ai extra", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert_eq!(result.get("repo"), Some(&"zed-ai".to_string()));
+        assert!(result.get("extra").is_none());
+    }
+
+    #[test]
+    fn key_value_multi_arg() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("owner=zed repo=zed-ai", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert_eq!(result.get("repo"), Some(&"zed-ai".to_string()));
+    }
+
+    #[test]
+    fn key_value_multi_arg_reverse_order() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("repo=zed-ai owner=zed", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert_eq!(result.get("repo"), Some(&"zed-ai".to_string()));
+    }
+
+    #[test]
+    fn partial_key_value() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("owner=zed", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"zed".to_string()));
+        assert!(result.get("repo").is_none());
+    }
+
+    #[test]
+    fn key_value_unknown_keys_fallback_to_positional() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("unknown=value", Some(&schema));
+        assert_eq!(result.get("owner"), Some(&"unknown=value".to_string()));
+    }
+
+    #[test]
+    fn url_with_equals_falls_back_to_positional() {
+        // No valid key found, so fallback to positional mapping
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("https://example.com/?a=b", Some(&schema));
+        assert_eq!(
+            result.get("owner"),
+            Some(&"https://example.com/?a=b".to_string())
+        );
+        assert!(result.get("repo").is_none());
+    }
+
+    #[test]
+    fn url_with_valid_key_uses_key_value() {
+        let schema = arg_schema(&["owner", "repo"]);
+        let result = parse_prompt_arguments("owner=https://example.com/?a=b", Some(&schema));
+        assert_eq!(
+            result.get("owner"),
+            Some(&"https://example.com/?a=b".to_string())
+        );
+    }
+
+    #[test]
+    fn key_equals_in_value() {
+        let schema = arg_schema(&["password", "host"]);
+        let result = parse_prompt_arguments("password=abc=def host=localhost", Some(&schema));
+        assert_eq!(result.get("password"), Some(&"abc=def".to_string()));
+        assert_eq!(result.get("host"), Some(&"localhost".to_string()));
+    }
+
+    #[test]
+    fn empty_input_multi_arg() {
+        let schema = arg_schema(&["owner", "repo"]);
+        assert!(parse_prompt_arguments("", Some(&schema)).is_empty());
     }
 }
